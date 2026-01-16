@@ -1,0 +1,4 @@
+pycparser>=2.21
+networkx>=3.1
+pgmpy>=0.1.23
+pytest>=7.4.0
