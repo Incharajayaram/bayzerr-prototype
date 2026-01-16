@@ -18,9 +18,11 @@ class CProgramParser:
         
         # Extracted data
         self.function_calls = []  # List of dicts
-        self.assignments = []     # List of (target, source) tuples
+        self.assignments = []     # List of dicts
         self.memory_ops = []      # List of dicts
         self.data_flows = []      # List of (source_var, target_var) tuples based on assignments
+        self.main_args = []       # List of arguments to main function
+        self.function_defs = {}   # Map function name -> list of parameter names
 
     def parse_file(self, filepath):
         """
@@ -57,6 +59,8 @@ class CProgramParser:
         self.assignments = []
         self.memory_ops = []
         self.data_flows = []
+        self.main_args = []
+        self.function_defs = {}
 
     def _analyze(self):
         """Runs the AST visitor to extract information."""
@@ -65,6 +69,57 @@ class CProgramParser:
             
         visitor = AnalysisVisitor(self)
         visitor.visit(self.ast)
+        
+        self._post_process_calls()
+
+    def _post_process_calls(self):
+        """Generates implicit flows from function calls to function parameters."""
+        for call in self.function_calls:
+            name = call['name']
+            if name in self.function_defs:
+                params = self.function_defs[name]
+                args = call['args']
+                
+                # Match args to params by position
+                for i, arg_expr in enumerate(args):
+                    if i < len(params):
+                        param_name = params[i]
+                        # Resolve argument to a variable name
+                        # We use a helper from visitor logic essentially, but simplified here
+                        # We need a way to resolve expr from the AST node 'arg_expr'
+                        # We can reuse the visitor's _resolve_expr logic if we make it static or part of parser?
+                        # Or just instantiate a visitor temporarily or move logic to parser.
+                        # Let's move _resolve_expr to CProgramParser as a static/helper or method.
+                        source_vars = self._extract_vars_from_node(arg_expr)
+                        for src in source_vars:
+                            self.data_flows.append((src, param_name))
+
+    def _extract_vars_from_node(self, node):
+        """Helper to extract variables, duplicated from Visitor logic for use in post-processing."""
+        # Simple extraction logic
+        vars_found = []
+        if isinstance(node, c_ast.ID):
+            vars_found.append(node.name)
+        elif isinstance(node, c_ast.BinaryOp):
+            vars_found.extend(self._extract_vars_from_node(node.left))
+            vars_found.extend(self._extract_vars_from_node(node.right))
+        elif isinstance(node, c_ast.UnaryOp):
+            vars_found.extend(self._extract_vars_from_node(node.expr))
+        elif isinstance(node, c_ast.ArrayRef):
+            # Resolve array access to the array name for coarse-grained taint
+            name = self._get_name_from_node(node.name)
+            if name:
+                vars_found.append(name)
+        elif isinstance(node, c_ast.Cast):
+            vars_found.extend(self._extract_vars_from_node(node.expr))
+        return vars_found
+
+    def _get_name_from_node(self, node):
+        if isinstance(node, c_ast.ID):
+            return node.name
+        elif isinstance(node, c_ast.ArrayRef):
+             return self._get_name_from_node(node.name)
+        return None
 
     def get_input_sources(self):
         """
@@ -76,65 +131,55 @@ class CProgramParser:
         sources = []
         for call in self.function_calls:
             if call['name'] in self.input_functions:
-                # Handle cases like x = atoi(argv[1])
-                # This is handled via assignments checking if source is a call
                 pass
             
-            # Handle cases like scanf("%s", buffer) -> buffer is source
-            # Simplistic heuristic: pointer arguments to input functions are sources
             if call['name'] == 'scanf' and len(call['args']) > 1:
-                # Skip format string, look at other args
                 for arg in call['args'][1:]:
                     if isinstance(arg, c_ast.UnaryOp) and arg.op == '&':
-                        # &x -> x is source
                          if isinstance(arg.expr, c_ast.ID):
                              sources.append(arg.expr.name)
                     elif isinstance(arg, c_ast.ID):
-                        # buffer -> buffer is source
                         sources.append(arg.name)
         
-        # Add sources from assignments where RHS is an input call (e.g. x = atoi(...))
-        for target, source in self.assignments:
+        for assignment in self.assignments:
+             target = assignment['target']
+             source = assignment['source']
              if isinstance(source, dict) and source.get('type') == 'call':
                  if source.get('name') in self.input_functions:
                      sources.append(target)
         
-        # Add main(argc, argv) arguments as sources if they are used
-        # (This would require scope analysis, for now we skip implicit main args as 'sources' 
-        # unless explicit access is detected, but simple heuristic: argv is a source)
+        sources.extend(self.main_args)
+        
         return list(set(sources))
 
     def get_assignments(self):
-        """
-        Returns list of assignments detected.
-        
-        Returns:
-            list: List of {'target': str, 'source': str/dict, 'line': int}
-        """
         return self.assignments
 
     def get_memory_operations(self):
-        """
-        Returns list of array accesses and pointer dereferences.
-        
-        Returns:
-            list: List of dicts describing the operation.
-        """
         return self.memory_ops
 
     def get_data_flows(self):
-        """
-        Returns potential data flow edges derived from assignments.
-        
-        Returns:
-            list: List of (source_var, target_var)
-        """
         return self.data_flows
 
 
 class AnalysisVisitor(c_ast.NodeVisitor):
     def __init__(self, parser_instance):
         self.parser = parser_instance
+
+    def visit_FuncDef(self, node):
+        func_name = node.decl.name
+        params = []
+        if node.decl.type.args:
+             for param in node.decl.type.args.params:
+                 if isinstance(param, c_ast.Decl):
+                     params.append(param.name)
+        
+        self.parser.function_defs[func_name] = params
+
+        if func_name == 'main':
+             self.parser.main_args.extend(params)
+        
+        self.generic_visit(node)
 
     def visit_FuncCall(self, node):
         func_name = ''
@@ -148,19 +193,18 @@ class AnalysisVisitor(c_ast.NodeVisitor):
         
         call_info = {
             'name': func_name,
-            'args': args,
+            'args': args, # Store raw AST nodes for post-processing
             'line': node.coord.line if node.coord else 0,
             'type': 'call'
         }
         self.parser.function_calls.append(call_info)
         
-        # Visit arguments to capture nested calls/ops
         if node.args:
             self.visit(node.args)
 
     def visit_Assignment(self, node):
         target = self._get_name(node.lvalue)
-        source = self._resolve_expr(node.rvalue)
+        source = self._resolve_expr(node.rvalue) 
         
         if target:
             self.parser.assignments.append({
@@ -169,17 +213,13 @@ class AnalysisVisitor(c_ast.NodeVisitor):
                 'line': node.coord.line if node.coord else 0
             })
             
-            # If source is a simple ID, record flow
-            if isinstance(source, str):
-                self.parser.data_flows.append((source, target))
-            elif isinstance(source, dict) and source.get('type') == 'call':
-                # Flow from function return to target
-                pass 
+            sources = self._extract_vars(node.rvalue)
+            for s in sources:
+                self.parser.data_flows.append((s, target))
 
         self.generic_visit(node)
 
     def visit_Decl(self, node):
-        # Handle declarations with initialization: int x = y;
         if node.init:
             target = node.name
             source = self._resolve_expr(node.init)
@@ -189,8 +229,10 @@ class AnalysisVisitor(c_ast.NodeVisitor):
                     'source': source,
                     'line': node.coord.line if node.coord else 0
                 })
-                if isinstance(source, str):
-                    self.parser.data_flows.append((source, target))
+                
+                sources = self._extract_vars(node.init)
+                for s in sources:
+                    self.parser.data_flows.append((s, target))
         
         self.generic_visit(node)
 
@@ -207,7 +249,6 @@ class AnalysisVisitor(c_ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_UnaryOp(self, node):
-        # Handle pointer dereference *ptr
         if node.op == '*':
             target = self._get_name(node.expr)
             self.parser.memory_ops.append({
@@ -218,7 +259,6 @@ class AnalysisVisitor(c_ast.NodeVisitor):
         self.generic_visit(node)
 
     def _get_name(self, node):
-        """Helper to extract variable name from node."""
         if isinstance(node, c_ast.ID):
             return node.name
         elif isinstance(node, c_ast.StructRef):
@@ -226,14 +266,18 @@ class AnalysisVisitor(c_ast.NodeVisitor):
             field = self._get_name(node.field)
             return f"{base}.{field}" if base and field else None
         elif isinstance(node, c_ast.ArrayRef):
-             # For array assignment like buf[i] = x, return buf
              return self._get_name(node.name)
         elif isinstance(node, c_ast.UnaryOp) and node.op == '*':
              return self._get_name(node.expr)
+        elif isinstance(node, c_ast.Cast):
+             return self._get_name(node.expr)
         return None
 
+    def _extract_vars(self, node):
+        # Uses the parser's helper method to avoid duplication
+        return self.parser._extract_vars_from_node(node)
+
     def _resolve_expr(self, node):
-        """Helper to resolve expression to a simple representation."""
         if isinstance(node, c_ast.ID):
             return node.name
         elif isinstance(node, c_ast.Constant):
@@ -246,11 +290,11 @@ class AnalysisVisitor(c_ast.NodeVisitor):
         elif isinstance(node, c_ast.BinaryOp):
             return f"BinaryOp({node.op})"
         elif isinstance(node, c_ast.ArrayRef):
-            return f"{self._get_name(node.name)}[]"
+            # Simplify: treat array ref as the array variable itself
+            return self._get_name(node.name) 
         return "ComplexExpr"
 
 if __name__ == "__main__":
-    # Example Usage
     parser = CProgramParser()
     import sys
     if len(sys.argv) > 1:
@@ -258,9 +302,7 @@ if __name__ == "__main__":
             parser.parse_file(sys.argv[1])
             print(f"Parsed {sys.argv[1]}")
             print("Input Sources:", parser.get_input_sources())
-            print("Assignments:", len(parser.get_assignments()))
-            print("Memory Ops:", len(parser.get_memory_operations()))
+            print("Data Flows:", parser.get_data_flows())
+            print("Memory Ops:", parser.get_memory_operations())
         except Exception as e:
             print(f"Error: {e}")
-    else:
-        print("Usage: python c_parser.py <file.c>")
